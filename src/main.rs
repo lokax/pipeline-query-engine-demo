@@ -5,6 +5,7 @@ use executor::PipelineExecutor;
 use executor::TableScan;
 use releation::Student;
 use releation::Table;
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 
 use crate::executor::Limit;
@@ -45,29 +46,47 @@ fn main() {
     executors.push(limit); // pull
 
     let mut pull_executor = PipelineExecutor::new(executors, true);
-    pipeline_executor.execute();
-    pull_executor.execute();
-    let result_set = pull_executor.get_result();
+    // pipeline_executor.execute();
+    // pull_executor.execute();
+    // let result_set = pull_executor.get_result();
+
+    let (sx, rx) = channel();
+    let (dsx, drx) = channel();
+    let handle_a = std::thread::spawn(move || {
+        pipeline_executor.execute();
+        sx.send(true).unwrap();
+    });
+
+    let handle_b = std::thread::spawn(move || {
+        rx.recv().unwrap();
+        pull_executor.execute();
+        dsx.send(pull_executor.get_result()).unwrap();
+    });
+
+    let result_set = drx.recv().unwrap();
+    handle_a.join().unwrap();
+    handle_b.join().unwrap();
     println!("result set: len {}", result_set.rows_num());
     println!("result set: columns len {}", result_set.columns_num());
     assert_eq!(result_set.rows_num(), 200);
     assert_eq!(result_set.columns_num(), 2);
-    // first value should be 2660, chunck's len should be 200 
+    // first value should be 2660, chunck's len should be 200
     for idx in 0..200 {
         let id = result_set.get_value(idx, 0);
         let age = result_set.get_value(idx, 1);
         println!("join result: id = {}, age = {}", id, age);
     }
 }
+
 /*                               Limit         |<without push> <early break>
- *                                 |           | 
+ *                                 |           |
  * (push the data to ht)        HashJoin       |
  * |<build ht>                 |         |     |<probe ht>
  * |                         Filter     Scan   |
  * |                           |               (piepeline 2)
  * |                          Scan             (get data from source operator)
  * (pipeline 1)
- * 
+ *
  *
  */
 
@@ -78,9 +97,8 @@ fn main() {
  *
  * Pipleline 2 should depend on pipeline 1
  *
- * Pull Based + Push Based
  *
  * Advantage:
- * 1、Data flow control is extracted to the pipeline executor
+ * 1、Data flow control is extracted to the pipeline executor(The executor just keep    computational logic)
  * 2、Ability to schedule pipelines tasks in parallel
 */

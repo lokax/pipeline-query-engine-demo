@@ -1,5 +1,9 @@
 use crate::releation::Table;
-use std::{any::Any, borrow::BorrowMut, cell::RefCell, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 pub struct Column(Vec<u32>);
 
@@ -40,17 +44,17 @@ impl DataChunk {
     }
 }
 
-pub trait PushFashion {
+pub trait PushFashion: Send + Sync + 'static {
     fn get_data(&self, _result: &mut DataChunk, _state: &mut Box<dyn SourceState>) {
-        unimplemented!("");
+        unimplemented!();
     }
 
     fn execute(&self, _input: &DataChunk, _state: &mut Box<dyn ExecuteState>) -> DataChunk {
-        unimplemented!("");
+        unimplemented!();
     }
 
     fn materialize(&self, _input: &DataChunk) {
-        unimplemented!("");
+        unimplemented!();
     }
 
     //TODO(lokax): use state
@@ -59,33 +63,152 @@ pub trait PushFashion {
     }
 
     fn get_source_state(&self) -> Box<dyn SourceState> {
-        unimplemented!("");
+        Box::new(DummyState)
     }
 
     fn get_execute_state(&self) -> Box<dyn ExecuteState> {
         Box::new(DummyState)
     }
 
-    //TODO(lokax): just for easy
     fn get_materialized_state(&self) -> Box<dyn MaterializedState> {
         Box::new(DummyState)
     }
 
+    //TODO(lokax): Remove
     fn is_pipeline_breaker(&self) -> bool {
         false
     }
 }
 
-pub trait SourceState {
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+// push
+pub struct PipelineExecutor {
+    executors: Vec<ExecutorRef>,
+    chunks: Vec<DataChunk>,
+    states: Vec<ExecutionState>,
+    _source_m_state: HashMap<usize, Box<dyn MaterializedState>>,
+    pull: bool,
 }
 
-pub trait ExecuteState {
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-}
+impl PipelineExecutor {
+    pub fn new(executors: Vec<ExecutorRef>, pull: bool) -> Self {
+        let mut chunks = Vec::new();
+        chunks.resize(executors.len(), DataChunk::new());
+        let mut states = vec![ExecutionState::Source(executors[0].get_source_state())];
+        // TODO(lokax): Maybe Bug
+        executors
+            .iter()
+            .take(executors.len() - 1)
+            .skip(1)
+            .for_each(|e| {
+                states.push(ExecutionState::Operator(e.get_execute_state()));
+            });
+        // TODO(lokax): Remove unused code
+        let _source_m_state = executors
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                if e.is_pipeline_breaker() {
+                    (idx, e.get_materialized_state())
+                } else {
+                    (idx, Box::new(DummyState) as Box<dyn MaterializedState>)
+                }
+            })
+            .collect::<HashMap<_, _>>();
 
-pub trait MaterializedState {
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+        if !pull {
+            states.push(ExecutionState::Materialized(
+                executors.last().unwrap().get_materialized_state(),
+            ));
+        } else {
+            states.push(ExecutionState::Operator(
+                executors.last().unwrap().get_execute_state(),
+            ));
+        }
+
+        Self {
+            executors,
+            chunks,
+            states,
+            pull,
+            _source_m_state,
+        }
+    }
+
+    pub fn execute(&mut self) {
+        if self.pull {
+            self.execute_pull();
+        } else {
+            self.execute_push();
+        }
+    }
+
+    pub fn execute_push(&mut self) {
+        'out: loop {
+            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
+            if self.chunks[0].rows_num() == 0 {
+                break;
+            }
+
+            let mut idx = 1;
+            let len = self.executors.len() - 1;
+            let mut finished = true;
+            while idx < len {
+                // TODO(lokax): Resolve Borrow Problem
+                let state = self.states[idx].get_execute_mut();
+                let chunk = self.executors[idx].execute(&self.chunks[idx - 1], state);
+
+                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
+                    break 'out;
+                }
+
+                if chunk.rows_num() == 0 {
+                    finished = false;
+                    break;
+                }
+                self.chunks[idx] = chunk;
+                idx += 1;
+            }
+
+            if finished {
+                self.executors[len].materialize(&self.chunks[len - 1]);
+            }
+            self.reset_chunck();
+        }
+    }
+
+    // Without Push Phase
+    pub fn execute_pull(&mut self) {
+        'out: loop {
+            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
+            if self.chunks[0].rows_num() == 0 {
+                break;
+            }
+            let mut idx = 1;
+            let len = self.executors.len();
+            while idx < len {
+                // TODO(lokax): Resolve Borrow Problem
+                let chunk = self.executors[idx]
+                    .execute(&self.chunks[idx - 1], self.states[idx].get_execute_mut());
+                self.chunks[idx] = chunk;
+                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
+                    break 'out;
+                }
+                if self.chunks[idx].rows_num() == 0 {
+                    break;
+                }
+                idx += 1;
+            }
+            self.reset_chunck();
+        }
+    }
+
+    pub fn get_result(mut self) -> DataChunk {
+        self.chunks.pop().unwrap()
+    }
+
+    fn reset_chunck(&mut self) {
+        self.chunks[0].reset();
+    }
 }
 
 enum ExecutionState {
@@ -98,52 +221,30 @@ impl ExecutionState {
     fn get_source_mut(&mut self) -> &mut Box<dyn SourceState> {
         match self {
             Self::Source(state) => state,
-            _ => unimplemented!(""),
+            _ => unimplemented!(),
         }
     }
 
     fn get_execute_mut(&mut self) -> &mut Box<dyn ExecuteState> {
         match self {
             Self::Operator(state) => state,
-            _ => unimplemented!(""),
+            _ => unimplemented!(),
         }
     }
 
+    // TODO(lokax): Remove unused code
     fn get_materialized_mut(&mut self) -> &mut Box<dyn MaterializedState> {
         match self {
             Self::Materialized(state) => state,
-            _ => unimplemented!(""),
+            _ => unimplemented!(),
         }
     }
 }
 
 struct DummyState;
 
-impl SourceState for DummyState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        unimplemented!("");
-    }
-}
-impl ExecuteState for DummyState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        unimplemented!("");
-    }
-}
-
-impl MaterializedState for DummyState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        unimplemented!("");
-    }
-}
-
 pub struct ScanState {
     group_idx: usize,
-}
-
-impl SourceState for ScanState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 pub struct TableScan {
@@ -175,7 +276,7 @@ impl PushFashion for TableScan {
 }
 
 pub struct Filter {
-    child: ExecutorRef, // just for build, for now, it is not important
+    child: ExecutorRef, // Just for build, for now, it is not important
 }
 
 impl Filter {
@@ -209,8 +310,7 @@ impl PushFashion for Filter {
 pub struct HashJoin {
     left: ExecutorRef,
     right: ExecutorRef,
-    // ht: RefCell<HashMap<u32, u32>>, // joins key --> tuple(just one column for easy)
-    m_state: RefCell<JoinHtState>,
+    m_state: Mutex<JoinHtState>, // joins key --> tuple(just one column for easy)
 }
 
 impl HashJoin {
@@ -219,7 +319,7 @@ impl HashJoin {
             left,
             right,
             // ht: RefCell::default(),
-            m_state: RefCell::new(JoinHtState {
+            m_state: Mutex::new(JoinHtState {
                 ht: HashMap::default(),
             }),
         }
@@ -228,12 +328,6 @@ impl HashJoin {
 
 struct JoinHtState {
     ht: HashMap<u32, u32>,
-}
-
-impl MaterializedState for JoinHtState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 impl PushFashion for HashJoin {
@@ -246,11 +340,12 @@ impl PushFashion for HashJoin {
         let size = input.rows_num();
         let mut column_left = Column(Vec::new()); // build table columns
         let mut column_right = Column(Vec::new()); // probe table columns
-                                                   // let ht_state = m_state.as_any_mut().downcast_mut::<JoinHtState>().unwrap();
-        let ht_state = &self.m_state;
+
+        // let ht_state = m_state.as_any_mut().downcast_mut::<JoinHtState>().unwrap();
+        let ht_state = self.m_state.lock().unwrap();
         while idx < size {
             let key = input.get_value(idx, 0); // probe table value
-            let ht = &ht_state.borrow().ht;
+            let ht = &ht_state.ht;
             let value = ht.get(&key);
             if value.is_some() {
                 column_right.0.push(key);
@@ -269,7 +364,8 @@ impl PushFashion for HashJoin {
         let mut idx = 0;
         let size = input.rows_num();
         // let ht_state = m_state.as_any_mut().downcast_mut::<JoinHtState>().unwrap();
-        let ht = &mut self.m_state.borrow_mut().ht;
+        let mut ht_state = self.m_state.lock().unwrap();
+        let ht = &mut ht_state.ht;
         while idx < size {
             let value = input.get_value(idx, 0);
             ht.insert(value, value);
@@ -302,12 +398,6 @@ impl Limit {
 
 struct LimitState {
     cursor: usize,
-}
-
-impl ExecuteState for LimitState {
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 // Limit 5, 10;
@@ -375,139 +465,50 @@ impl PushFashion for Limit {
     }
 }
 
-// push
-pub struct PipelineExecutor {
-    executors: Vec<ExecutorRef>,
-    chunks: Vec<DataChunk>,
-    states: Vec<ExecutionState>,
-    source_m_state: HashMap<usize, Box<dyn MaterializedState>>,
-    pull: bool,
+pub trait SourceState: Send + Sync + 'static {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-impl PipelineExecutor {
-    pub fn new(executors: Vec<ExecutorRef>, pull: bool) -> Self {
-        let mut chunks = Vec::new();
-        chunks.resize(executors.len(), DataChunk::new());
-        let mut states = vec![ExecutionState::Source(executors[0].get_source_state())];
-        println!("size = {}", executors.len());
-        // TODO(lokax): Maybe Bug
-        executors
-            .iter()
-            .take(executors.len() - 1)
-            .skip(1)
-            .for_each(|e| {
-                println!("111");
-                states.push(ExecutionState::Operator(e.get_execute_state()));
-            });
-        // unused
-        let source_m_state = executors
-            .iter()
-            .enumerate()
-            .map(|(idx, e)| {
-                if e.is_pipeline_breaker() {
-                    (idx, e.get_materialized_state())
-                } else {
-                    (idx, Box::new(DummyState) as Box<dyn MaterializedState>)
-                }
-            })
-            .collect::<HashMap<_, _>>();
+pub trait ExecuteState: Send + Sync + 'static {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
 
-        if !pull {
-            states.push(ExecutionState::Materialized(
-                executors.last().unwrap().get_materialized_state(),
-            ));
-        } else {
-            states.push(ExecutionState::Operator(
-                executors.last().unwrap().get_execute_state(),
-            ));
-        }
-        println!("states len = {}", states.len());
+pub trait MaterializedState: Send + Sync + 'static {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
 
-        Self {
-            executors,
-            chunks,
-            states,
-            pull,
-            source_m_state,
-        }
+// TODO(lokax): macro!
+impl SourceState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!();
     }
-
-    pub fn execute(&mut self) {
-        if self.pull {
-            self.execute_pull();
-        } else {
-            self.execute_push();
-        }
+}
+impl ExecuteState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!();
     }
+}
 
-    pub fn execute_push(&mut self) {
-        'out: loop {
-            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
-            if self.chunks[0].rows_num() == 0 {
-                break;
-            }
-
-            let mut idx = 1;
-            let len = self.executors.len() - 1;
-            let mut finished = true;
-            while idx < len {
-                // TODO(lokax): Resolve Borrow Problem
-                let state = self.states[idx].get_execute_mut();
-                let chunk = self.executors[idx].execute(&self.chunks[idx - 1], state);
-
-                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
-                    break 'out;
-                }
-
-                if chunk.rows_num() == 0 {
-                    finished = false;
-                    break;
-                }
-                self.chunks[idx] = chunk;
-                idx += 1;
-            }
-
-            if finished {
-                self.executors[len].materialize(&self.chunks[len - 1]);
-            }
-            self.reset_chunck();
-        }
+impl MaterializedState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!();
     }
+}
 
-    // Without Push Phase
-    pub fn execute_pull(&mut self) {
-        'out: loop {
-            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
-            if self.chunks[0].rows_num() == 0 {
-                break;
-            }
-            let mut idx = 1;
-            let len = self.executors.len();
-            println!("len = = {}", len);
-            while idx < len {
-                println!("idx = {}", idx);
-                // TODO(lokax): Resolve Borrow Problem
-                let chunk = self.executors[idx]
-                    .execute(&self.chunks[idx - 1], self.states[idx].get_execute_mut());
-                self.chunks[idx] = chunk;
-                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
-                    println!("out");
-                    break 'out;
-                }
-                if self.chunks[idx].rows_num() == 0 {
-                    break;
-                }
-                idx += 1;
-            }
-            self.reset_chunck();
-        }
+impl SourceState for ScanState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
+}
 
-    pub fn get_result(&self) -> &DataChunk {
-        self.chunks.last().unwrap()
+impl MaterializedState for JoinHtState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
+}
 
-    fn reset_chunck(&mut self) {
-        self.chunks[0].reset();
+impl ExecuteState for LimitState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
