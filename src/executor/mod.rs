@@ -1,6 +1,5 @@
 use crate::releation::Table;
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
-
+use std::{any::Any, borrow::BorrowMut, cell::RefCell, collections::HashMap, sync::Arc};
 
 pub struct Column(Vec<u32>);
 
@@ -42,53 +41,136 @@ impl DataChunk {
 }
 
 pub trait PushFashion {
-    fn get_data(&self, _result: &mut DataChunk) {
+    fn get_data(&self, _result: &mut DataChunk, _state: &mut Box<dyn SourceState>) {
         unimplemented!("");
     }
 
-    fn execute(&self, _input: &DataChunk) -> DataChunk {
+    fn execute(&self, _input: &DataChunk, _state: &mut Box<dyn ExecuteState>) -> DataChunk {
         unimplemented!("");
     }
 
-    fn push(&self, _input: &DataChunk) {
+    fn materialize(&self, _input: &DataChunk) {
         unimplemented!("");
     }
 
     //TODO(lokax): use state
-    fn is_end(&self) -> bool {
+    fn is_end(&self, _: &mut Box<dyn ExecuteState>) -> bool {
         false
+    }
+
+    fn get_source_state(&self) -> Box<dyn SourceState> {
+        unimplemented!("");
+    }
+
+    fn get_execute_state(&self) -> Box<dyn ExecuteState> {
+        Box::new(DummyState)
+    }
+
+    //TODO(lokax): just for easy
+    fn get_materialized_state(&self) -> Box<dyn MaterializedState> {
+        Box::new(DummyState)
+    }
+
+    fn is_pipeline_breaker(&self) -> bool {
+        false
+    }
+}
+
+pub trait SourceState {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+pub trait ExecuteState {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+pub trait MaterializedState {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+enum ExecutionState {
+    Source(Box<dyn SourceState>),
+    Operator(Box<dyn ExecuteState>),
+    Materialized(Box<dyn MaterializedState>),
+}
+
+impl ExecutionState {
+    fn get_source_mut(&mut self) -> &mut Box<dyn SourceState> {
+        match self {
+            Self::Source(state) => state,
+            _ => unimplemented!(""),
+        }
+    }
+
+    fn get_execute_mut(&mut self) -> &mut Box<dyn ExecuteState> {
+        match self {
+            Self::Operator(state) => state,
+            _ => unimplemented!(""),
+        }
+    }
+
+    fn get_materialized_mut(&mut self) -> &mut Box<dyn MaterializedState> {
+        match self {
+            Self::Materialized(state) => state,
+            _ => unimplemented!(""),
+        }
+    }
+}
+
+struct DummyState;
+
+impl SourceState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!("");
+    }
+}
+impl ExecuteState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!("");
+    }
+}
+
+impl MaterializedState for DummyState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        unimplemented!("");
+    }
+}
+
+pub struct ScanState {
+    group_idx: usize,
+}
+
+impl SourceState for ScanState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
 pub struct TableScan {
     table: Table,
-    group_idx: RefCell<usize>, // just for easy
-                               // TODO(lokax): Create a state, Pass in PushFashion::Execute, Avoid RefCell
 }
 
 impl TableScan {
     pub fn new(table: Table) -> Self {
-        Self {
-            table,
-            group_idx: RefCell::new(0),
-        }
+        Self { table }
     }
 }
 
 impl PushFashion for TableScan {
-    fn get_data(&self, result: &mut DataChunk) {
-        let datas = self.table.get_rows_group(*self.group_idx.borrow());
-        println!(
-            "datas num {}, idx {}",
-            datas.len(),
-            *self.group_idx.borrow()
-        );
-        *self.group_idx.borrow_mut() += 1;
+    fn get_data(&self, result: &mut DataChunk, state: &mut Box<dyn SourceState>) {
+        let state = state.as_any_mut().downcast_mut::<ScanState>().unwrap();
+        let datas = self.table.get_rows_group(state.group_idx);
+        println!("datas num {}, idx {}", datas.len(), state.group_idx);
+        state.group_idx += 1;
         let mut id_column = Column(Vec::new());
         for student in datas {
             id_column.0.push(student.get_id());
         }
         result.push_columns(Arc::new(id_column));
+    }
+
+    fn get_source_state(&self) -> Box<dyn SourceState> {
+        Box::new(ScanState { group_idx: 0 })
     }
 }
 
@@ -103,7 +185,7 @@ impl Filter {
 }
 
 impl PushFashion for Filter {
-    fn execute(&self, input: &DataChunk) -> DataChunk {
+    fn execute(&self, input: &DataChunk, _: &mut Box<dyn ExecuteState>) -> DataChunk {
         let mut idx = 0;
         let size = input.rows_num();
         let mut column = Column(Vec::new());
@@ -118,12 +200,17 @@ impl PushFashion for Filter {
         result.push_columns(Arc::new(column));
         result
     }
+
+    fn get_execute_state(&self) -> Box<dyn ExecuteState> {
+        Box::new(DummyState)
+    }
 }
 
 pub struct HashJoin {
     left: ExecutorRef,
     right: ExecutorRef,
-    ht: RefCell<HashMap<u32, u32>>, // joins key --> tuple(just one column for easy)
+    // ht: RefCell<HashMap<u32, u32>>, // joins key --> tuple(just one column for easy)
+    m_state: RefCell<JoinHtState>,
 }
 
 impl HashJoin {
@@ -131,20 +218,39 @@ impl HashJoin {
         Self {
             left,
             right,
-            ht: RefCell::default(),
+            // ht: RefCell::default(),
+            m_state: RefCell::new(JoinHtState {
+                ht: HashMap::default(),
+            }),
         }
     }
 }
 
+struct JoinHtState {
+    ht: HashMap<u32, u32>,
+}
+
+impl MaterializedState for JoinHtState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 impl PushFashion for HashJoin {
-    fn execute(&self, input: &DataChunk) -> DataChunk {
+    fn is_pipeline_breaker(&self) -> bool {
+        true
+    }
+
+    fn execute(&self, input: &DataChunk, _e_state: &mut Box<dyn ExecuteState>) -> DataChunk {
         let mut idx = 0;
         let size = input.rows_num();
         let mut column_left = Column(Vec::new()); // build table columns
         let mut column_right = Column(Vec::new()); // probe table columns
+                                                   // let ht_state = m_state.as_any_mut().downcast_mut::<JoinHtState>().unwrap();
+        let ht_state = &self.m_state;
         while idx < size {
             let key = input.get_value(idx, 0); // probe table value
-            let ht = self.ht.borrow();
+            let ht = &ht_state.borrow().ht;
             let value = ht.get(&key);
             if value.is_some() {
                 column_right.0.push(key);
@@ -159,47 +265,64 @@ impl PushFashion for HashJoin {
     }
 
     // push data to hash table(build side)
-    fn push(&self, input: &DataChunk) {
+    fn materialize(&self, input: &DataChunk) {
         let mut idx = 0;
         let size = input.rows_num();
+        // let ht_state = m_state.as_any_mut().downcast_mut::<JoinHtState>().unwrap();
+        let ht = &mut self.m_state.borrow_mut().ht;
         while idx < size {
             let value = input.get_value(idx, 0);
-            self.ht.borrow_mut().insert(value, value);
+            ht.insert(value, value);
             idx += 1;
         }
+    }
+
+    fn get_materialized_state(&self) -> Box<dyn MaterializedState> {
+        Box::new(JoinHtState {
+            ht: HashMap::default(),
+        })
     }
 }
 
 pub struct Limit {
     child: ExecutorRef,
-    offset: RefCell<usize>,
-    limit: RefCell<usize>,
-    cursor: RefCell<usize>,
+    offset: usize,
+    limit: usize,
 }
 
 impl Limit {
     pub fn new(child: ExecutorRef, offset: usize, limit: usize) -> Self {
         Self {
             child,
-            offset: RefCell::new(offset),
-            limit: RefCell::new(limit),
-            cursor: RefCell::new(0),
+            offset,
+            limit,
         }
+    }
+}
+
+struct LimitState {
+    cursor: usize,
+}
+
+impl ExecuteState for LimitState {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
 // Limit 5, 10;
 impl PushFashion for Limit {
-    fn execute(&self, input: &DataChunk) -> DataChunk {
-        let max_data_count = *self.offset.borrow() + *self.limit.borrow();
-        if *self.cursor.borrow() >= max_data_count {
+    fn execute(&self, input: &DataChunk, state: &mut Box<dyn ExecuteState>) -> DataChunk {
+        let limit_state = state.as_any_mut().downcast_mut::<LimitState>().unwrap();
+        let max_data_count = self.offset + self.limit;
+        if limit_state.cursor >= max_data_count {
             // TODO(lokax): Return a finished state to exist execute_pull early
             return DataChunk::new();
         }
 
-        let current_offset = *self.cursor.borrow();
-        let offset = *self.offset.borrow();
-        let limit = *self.limit.borrow();
+        let current_offset = limit_state.cursor;
+        let offset = self.offset;
+        let limit = self.limit;
 
         // just hard code for test
         let mut column_a = Column(Vec::new()); // TODO(lokax): use vector
@@ -207,8 +330,8 @@ impl PushFashion for Limit {
 
         let mut chunk = DataChunk::new();
         if current_offset < offset {
-            if input.rows_num() + *self.cursor.borrow() < *self.offset.borrow() {
-                *self.cursor.borrow_mut() += input.rows_num();
+            if input.rows_num() + limit_state.cursor < self.offset {
+                limit_state.cursor += input.rows_num();
                 return chunk;
             } else {
                 let start_offset = offset - current_offset;
@@ -219,7 +342,7 @@ impl PushFashion for Limit {
                 }
                 chunk.push_columns(Arc::new(column_a));
                 chunk.push_columns(Arc::new(column_b));
-                *self.cursor.borrow_mut() += input.rows_num();
+                limit_state.cursor += input.rows_num();
                 return chunk;
             }
         } else {
@@ -236,13 +359,19 @@ impl PushFashion for Limit {
             }
             chunk.push_columns(Arc::new(column_a));
             chunk.push_columns(Arc::new(column_b));
-            *self.cursor.borrow_mut() += input.rows_num();
+            limit_state.cursor += input.rows_num();
             return chunk;
         }
     }
 
-    fn is_end(&self) -> bool {
-        *self.cursor.borrow_mut() >= *self.offset.borrow() + *self.limit.borrow()
+    fn get_execute_state(&self) -> Box<dyn ExecuteState> {
+        Box::new(LimitState { cursor: 0 })
+    }
+
+    // TODO(lokax): Remove this.
+    fn is_end(&self, state: &mut Box<dyn ExecuteState>) -> bool {
+        let limit_state = state.as_any_mut().downcast_mut::<LimitState>().unwrap();
+        limit_state.cursor >= self.offset + self.limit
     }
 }
 
@@ -250,6 +379,8 @@ impl PushFashion for Limit {
 pub struct PipelineExecutor {
     executors: Vec<ExecutorRef>,
     chunks: Vec<DataChunk>,
+    states: Vec<ExecutionState>,
+    source_m_state: HashMap<usize, Box<dyn MaterializedState>>,
     pull: bool,
 }
 
@@ -257,10 +388,47 @@ impl PipelineExecutor {
     pub fn new(executors: Vec<ExecutorRef>, pull: bool) -> Self {
         let mut chunks = Vec::new();
         chunks.resize(executors.len(), DataChunk::new());
+        let mut states = vec![ExecutionState::Source(executors[0].get_source_state())];
+        println!("size = {}", executors.len());
+        // TODO(lokax): Maybe Bug
+        executors
+            .iter()
+            .take(executors.len() - 1)
+            .skip(1)
+            .for_each(|e| {
+                println!("111");
+                states.push(ExecutionState::Operator(e.get_execute_state()));
+            });
+        // unused
+        let source_m_state = executors
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                if e.is_pipeline_breaker() {
+                    (idx, e.get_materialized_state())
+                } else {
+                    (idx, Box::new(DummyState) as Box<dyn MaterializedState>)
+                }
+            })
+            .collect::<HashMap<_, _>>();
+
+        if !pull {
+            states.push(ExecutionState::Materialized(
+                executors.last().unwrap().get_materialized_state(),
+            ));
+        } else {
+            states.push(ExecutionState::Operator(
+                executors.last().unwrap().get_execute_state(),
+            ));
+        }
+        println!("states len = {}", states.len());
+
         Self {
             executors,
             chunks,
+            states,
             pull,
+            source_m_state,
         }
     }
 
@@ -274,7 +442,7 @@ impl PipelineExecutor {
 
     pub fn execute_push(&mut self) {
         'out: loop {
-            self.executors[0].get_data(&mut self.chunks[0]);
+            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
             if self.chunks[0].rows_num() == 0 {
                 break;
             }
@@ -284,9 +452,10 @@ impl PipelineExecutor {
             let mut finished = true;
             while idx < len {
                 // TODO(lokax): Resolve Borrow Problem
-                let chunk = self.executors[idx].execute(&self.chunks[idx - 1]);
+                let state = self.states[idx].get_execute_mut();
+                let chunk = self.executors[idx].execute(&self.chunks[idx - 1], state);
 
-                if self.executors[idx].is_end() {
+                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
                     break 'out;
                 }
 
@@ -299,7 +468,7 @@ impl PipelineExecutor {
             }
 
             if finished {
-                self.executors[len].push(&self.chunks[len - 1]);
+                self.executors[len].materialize(&self.chunks[len - 1]);
             }
             self.reset_chunck();
         }
@@ -308,17 +477,20 @@ impl PipelineExecutor {
     // Without Push Phase
     pub fn execute_pull(&mut self) {
         'out: loop {
-            self.executors[0].get_data(&mut self.chunks[0]);
+            self.executors[0].get_data(&mut self.chunks[0], self.states[0].get_source_mut());
             if self.chunks[0].rows_num() == 0 {
                 break;
             }
             let mut idx = 1;
             let len = self.executors.len();
+            println!("len = = {}", len);
             while idx < len {
+                println!("idx = {}", idx);
                 // TODO(lokax): Resolve Borrow Problem
-                let chunk = self.executors[idx].execute(&self.chunks[idx - 1]);
+                let chunk = self.executors[idx]
+                    .execute(&self.chunks[idx - 1], self.states[idx].get_execute_mut());
                 self.chunks[idx] = chunk;
-                if self.executors[idx].is_end() {
+                if self.executors[idx].is_end(self.states[idx].get_execute_mut()) {
                     println!("out");
                     break 'out;
                 }
